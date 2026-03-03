@@ -1,0 +1,47 @@
+"""
+Management command to send reminder emails for tomorrow's bookings.
+Run daily via Windows Task Scheduler or cron:
+
+  python manage.py send_reminders
+
+Schedule it to run every day at 6 PM.
+"""
+
+from django.core.management.base import BaseCommand
+from django.utils import timezone
+from datetime import timedelta
+from bookings.models import Booking
+from notifications.email_utils import send_reminder_email
+
+
+class Command(BaseCommand):
+    help = 'Send reminder emails for bookings scheduled for tomorrow'
+
+    def handle(self, *args, **kwargs):
+        tomorrow = timezone.now().date() + timedelta(days=1)
+
+        bookings = Booking.objects.filter(
+            date=tomorrow,
+            status='confirmed',
+        ).select_related('user', 'service')
+
+        self.stdout.write(f"Found {bookings.count()} bookings for tomorrow ({tomorrow})")
+
+        sent = 0
+        skipped = 0
+
+        for booking in bookings:
+            if booking.user.email:
+                success = send_reminder_email(booking)
+                if success:
+                    sent += 1
+                    self.stdout.write(f"  ✅ Reminder sent → {booking.user.email} ({booking.booking_id})")
+                else:
+                    self.stdout.write(f"  ❌ Failed → {booking.user.email}")
+            else:
+                skipped += 1
+                self.stdout.write(f"  ⚠️  Skipped — no email for {booking.user.phone}")
+
+        self.stdout.write(self.style.SUCCESS(
+            f"\nDone! Sent: {sent} | Skipped (no email): {skipped}"
+        ))

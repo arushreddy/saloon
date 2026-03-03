@@ -9,10 +9,8 @@ body {
   color: #ffffff;
 }
 
-/* Custom scrollbar */
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: #1a1a2e; }
 ::-webkit-scrollbar-thumb { background: #6C63FF; border-radius: 3px; }
 
-/* Toast overrides */
 .Toastify__toast { background: #16213e !important; color: white !important; }

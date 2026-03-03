@@ -13,6 +13,18 @@ from .serializers import (
 from services.models import Service
 
 
+def get_slot_config(slot_date):
+    """
+    Returns (config_or_None, is_open, opening, closing, max_per_slot).
+    Centralizes default fallback logic in one place.
+    """
+    try:
+        config = SlotConfig.objects.get(date=slot_date)
+        return config, config.is_open, config.opening_hour, config.closing_hour, config.max_bookings_per_slot
+    except SlotConfig.DoesNotExist:
+        return None, True, 9, 21, 5
+
+
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def get_available_slots(request):
@@ -27,25 +39,15 @@ def get_available_slots(request):
     except ValueError:
         return Response({'error': 'Invalid date format. Use YYYY-MM-DD'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Check if date is in the past
     if slot_date < date.today():
         return Response({'error': 'Cannot book past dates'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Get slot config for this date (or use defaults)
-    try:
-        config = SlotConfig.objects.get(date=slot_date)
-        if not config.is_open:
-            return Response({'message': 'This date is closed', 'slots': []})
-        opening = config.opening_hour
-        closing = config.closing_hour
-        max_per_slot = config.max_bookings_per_slot
-    except SlotConfig.DoesNotExist:
-        # Default: open 9AM-9PM, 5 per slot
-        opening = 9
-        closing = 21
-        max_per_slot = 5
+    config, is_open, opening, closing, max_per_slot = get_slot_config(slot_date)
 
-    # Count bookings per slot
+    if not is_open:
+        return Response({'date': str(slot_date), 'message': 'This date is closed', 'slots': [], 'is_open': False})
+
+    # FIX #2: Count only active bookings (pending + confirmed)
     booked = Booking.objects.filter(
         date=slot_date,
         status__in=['pending', 'confirmed']
@@ -53,7 +55,6 @@ def get_available_slots(request):
 
     booked_map = {item['time_slot']: item['count'] for item in booked}
 
-    # Build slots
     slots = []
     for hour in range(opening, closing):
         count = booked_map.get(hour, 0)
@@ -86,18 +87,26 @@ def get_available_dates(request):
     today = date.today()
     dates = []
 
+    # Fetch all SlotConfig rows for the range in ONE query (not 30 queries)
+    date_range_end = today + timedelta(days=30)
+    configs = SlotConfig.objects.filter(
+        date__gte=today,
+        date__lte=date_range_end
+    )
+    config_map = {str(c.date): c for c in configs}
+
     for i in range(30):
         d = today + timedelta(days=i)
-        try:
-            config = SlotConfig.objects.get(date=d)
-            is_open = config.is_open
-        except SlotConfig.DoesNotExist:
-            is_open = True  # Default: open
+        d_str = str(d)
+        config = config_map.get(d_str)
 
         dates.append({
-            'date': str(d),
+            'date': d_str,
             'day_name': d.strftime('%A'),
-            'is_open': is_open,
+            'is_open': config.is_open if config else True,
+            'opening_hour': config.opening_hour if config else 9,
+            'closing_hour': config.closing_hour if config else 21,
+            'max_bookings_per_slot': config.max_bookings_per_slot if config else 5,
         })
 
     return Response(dates)
@@ -125,35 +134,31 @@ def create_booking(request):
     if booking_date < date.today():
         return Response({'error': 'Cannot book past dates'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # Get slot config
-    try:
-        config = SlotConfig.objects.get(date=booking_date)
-        if not config.is_open:
-            return Response({'error': 'This date is closed'}, status=status.HTTP_400_BAD_REQUEST)
-        max_per_slot = config.max_bookings_per_slot
-        if time_slot < config.opening_hour or time_slot >= config.closing_hour:
-            return Response({'error': 'Invalid time slot for this date'}, status=status.HTTP_400_BAD_REQUEST)
-    except SlotConfig.DoesNotExist:
-        max_per_slot = 5
-        if time_slot < 9 or time_slot >= 21:
-            return Response({'error': 'Invalid time slot'}, status=status.HTTP_400_BAD_REQUEST)
+    # Get slot config using shared helper
+    config, is_open, opening, closing, max_per_slot = get_slot_config(booking_date)
+
+    if not is_open:
+        return Response({'error': 'This date is closed'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if time_slot < opening or time_slot >= closing:
+        return Response({'error': f'Invalid time slot. Valid range: {opening}:00 — {closing}:00'}, status=status.HTTP_400_BAD_REQUEST)
 
     # ATOMIC TRANSACTION — prevents race conditions
     with transaction.atomic():
-        # Lock and count current bookings for this slot
+        # Lock rows for this slot to prevent concurrent overbooking
         current_count = Booking.objects.select_for_update().filter(
             date=booking_date,
             time_slot=time_slot,
-            status__in=['pending', 'confirmed']
+            status__in=['pending', 'confirmed']  # FIX #2: explicit status filter
         ).count()
 
         if current_count >= max_per_slot:
             return Response(
-                {'error': 'This slot is fully booked'},
+                {'error': 'This slot is fully booked. Please choose another time.'},
                 status=status.HTTP_409_CONFLICT
             )
 
-        # Check duplicate booking
+        # Check duplicate booking for this user
         exists = Booking.objects.filter(
             user=request.user,
             date=booking_date,
@@ -164,11 +169,10 @@ def create_booking(request):
 
         if exists:
             return Response(
-                {'error': 'You already have a booking for this slot'},
+                {'error': 'You already have a booking for this slot and service.'},
                 status=status.HTTP_409_CONFLICT
             )
 
-        # Create booking
         booking = Booking.objects.create(
             user=request.user,
             service=service,
@@ -189,7 +193,7 @@ def create_booking(request):
 def my_bookings(request):
     """Get current user's bookings."""
     filter_status = request.query_params.get('status')
-    bookings = Booking.objects.filter(user=request.user)
+    bookings = Booking.objects.filter(user=request.user).select_related('service')
 
     if filter_status:
         bookings = bookings.filter(status=filter_status)
@@ -208,10 +212,18 @@ def cancel_booking(request, booking_id):
         return Response({'error': 'Booking not found'}, status=status.HTTP_404_NOT_FOUND)
 
     if booking.status in ['cancelled', 'completed']:
-        return Response({'error': 'Cannot cancel this booking'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({'error': f'Cannot cancel a {booking.status} booking.'}, status=status.HTTP_400_BAD_REQUEST)
 
     booking.status = 'cancelled'
     booking.save()
+
+    # Send cancellation WhatsApp
+    try:
+        from notifications.utils import send_cancellation_message
+        send_cancellation_message(booking)
+    except Exception as e:
+        print(f"[WhatsApp] Cancellation notification failed: {e}")
+
     return Response({'message': 'Booking cancelled', 'booking': BookingSerializer(booking).data})
 
 
@@ -224,9 +236,8 @@ def admin_all_bookings(request):
     if not request.user.is_admin:
         return Response({'error': 'Admin only'}, status=status.HTTP_403_FORBIDDEN)
 
-    bookings = Booking.objects.all()
+    bookings = Booking.objects.all().select_related('user', 'service')
 
-    # Filters
     filter_date = request.query_params.get('date')
     filter_status = request.query_params.get('status')
     filter_service = request.query_params.get('service_id')
@@ -253,6 +264,13 @@ def admin_update_slot(request):
     serializer.is_valid(raise_exception=True)
 
     slot_date = serializer.validated_data['date']
+
+    # Validate hours
+    opening = serializer.validated_data.get('opening_hour', 9)
+    closing = serializer.validated_data.get('closing_hour', 21)
+    if opening >= closing:
+        return Response({'error': 'Opening hour must be before closing hour'}, status=status.HTTP_400_BAD_REQUEST)
+
     config, created = SlotConfig.objects.update_or_create(
         date=slot_date,
         defaults=serializer.validated_data
@@ -276,10 +294,21 @@ def admin_update_booking_status(request, booking_id):
     except Booking.DoesNotExist:
         return Response({'error': 'Booking not found'}, status=status.HTTP_404_NOT_FOUND)
 
+    valid_statuses = ['pending', 'confirmed', 'completed', 'cancelled', 'no_show']
     new_status = request.data.get('status')
-    if new_status not in ['pending', 'confirmed', 'completed', 'cancelled', 'no_show']:
-        return Response({'error': 'Invalid status'}, status=status.HTTP_400_BAD_REQUEST)
+    if new_status not in valid_statuses:
+        return Response({'error': f'Invalid status. Must be one of: {", ".join(valid_statuses)}'}, status=status.HTTP_400_BAD_REQUEST)
 
+    old_status = booking.status
     booking.status = new_status
     booking.save()
+
+    # Send WhatsApp notification on confirm
+    if old_status != 'confirmed' and new_status == 'confirmed':
+        try:
+            from notifications.utils import send_booking_confirmation
+            send_booking_confirmation(booking)
+        except Exception as e:
+            print(f"[WhatsApp] Notification failed: {e}")
+
     return Response({'message': 'Status updated', 'booking': BookingSerializer(booking).data})

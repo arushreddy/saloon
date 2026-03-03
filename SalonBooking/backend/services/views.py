@@ -9,10 +9,19 @@ from .serializers import ServiceSerializer, ServiceListSerializer
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def list_services(request):
-    """Public: List all active services."""
-    services = Service.objects.filter(is_active=True)
+    """
+    Public: List all active services.
+    FIX #5: Admin users can also see inactive services by passing ?all=true
+    """
+    # Check if requester is admin and wants all services
+    show_all = (
+        request.query_params.get('all') == 'true'
+        and request.user.is_authenticated
+        and request.user.is_admin
+    )
 
-    # Filter by category if provided
+    services = Service.objects.all() if show_all else Service.objects.filter(is_active=True)
+
     category = request.query_params.get('category')
     if category:
         services = services.filter(category__iexact=category)
@@ -37,10 +46,15 @@ def service_detail(request, pk):
 @api_view(['GET'])
 @permission_classes([AllowAny])
 def service_categories(request):
-    """Public: Get all unique categories."""
-    categories = Service.objects.filter(
-        is_active=True
-    ).values_list('category', flat=True).distinct()
+    """Public: Get all unique non-empty categories."""
+    categories = (
+        Service.objects
+        .filter(is_active=True)
+        .exclude(category='')
+        .values_list('category', flat=True)
+        .distinct()
+        .order_by('category')
+    )
     return Response(list(categories))
 
 
@@ -55,19 +69,19 @@ def create_service(request):
 
     serializer = ServiceSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-    serializer.save()
-    return Response(serializer.data, status=status.HTTP_201_CREATED)
+    service = serializer.save()
+    return Response(ServiceSerializer(service).data, status=status.HTTP_201_CREATED)
 
 
 @api_view(['PUT'])
 @permission_classes([IsAuthenticated])
 def update_service(request, pk):
-    """Admin: Update service."""
+    """Admin: Update service (partial update supported)."""
     if not request.user.is_admin:
         return Response({'error': 'Admin only'}, status=status.HTTP_403_FORBIDDEN)
 
     try:
-        service = Service.objects.get(pk=pk)
+        service = Service.objects.get(pk=pk)  # Admin can edit even inactive
     except Service.DoesNotExist:
         return Response({'error': 'Service not found'}, status=status.HTTP_404_NOT_FOUND)
 
@@ -80,7 +94,7 @@ def update_service(request, pk):
 @api_view(['DELETE'])
 @permission_classes([IsAuthenticated])
 def delete_service(request, pk):
-    """Admin: Delete (deactivate) service."""
+    """Admin: Soft-delete (deactivate) service."""
     if not request.user.is_admin:
         return Response({'error': 'Admin only'}, status=status.HTTP_403_FORBIDDEN)
 
@@ -89,6 +103,9 @@ def delete_service(request, pk):
     except Service.DoesNotExist:
         return Response({'error': 'Service not found'}, status=status.HTTP_404_NOT_FOUND)
 
+    if not service.is_active:
+        return Response({'error': 'Service is already deactivated'}, status=status.HTTP_400_BAD_REQUEST)
+
     service.is_active = False
     service.save()
-    return Response({'message': 'Service deactivated'})
+    return Response({'message': f'Service "{service.name}" deactivated successfully'})
